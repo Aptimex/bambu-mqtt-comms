@@ -161,17 +161,3 @@ with BambuMQTTClient(config) as client:
     response = client.send_and_wait(payload)
     print("Response:", response)
 ```
-
-## Design Philosophy
-
-This library intentionally does **not** handle:
-- Message signing (use `bambu-mqtt-generator`'s `sign_mqtt` module)
-- `app_cert_install` bootstrap (call `send_and_wait` with security payload)
-- Command-specific response parsing
-- Filament/AMS data structures
-
-It provides only the transport layer: connect, send JSON, wait for matching response by `sequence_id`.
-
-## License
-
-MIT

@@ -6,6 +6,7 @@ Command formatting and response parsing are left to the caller (e.g., bambu-mqtt
 """
 
 import json
+import random
 import ssl
 import time
 import threading
@@ -227,7 +228,7 @@ class BambuMQTTClient:
         Returns:
             The push_status response data.
         """
-        seq = sequence_id or str(int(time.time() * 1000))
+        seq = sequence_id or self.random_sequence_id()
         payload = {"pushing": {"sequence_id": seq, "command": "pushall", "version": 1, "push_target": 1}}
         
         # Clear previous status
@@ -261,7 +262,7 @@ class BambuMQTTClient:
             TimeoutError: If no response received within timeout.
             ConnectionError: If not connected.
         """
-        seq = str(int(time.time() * 1000))
+        seq = self.random_sequence_id()
         payload = {
             "security": {
                 "command": "app_cert_list",
@@ -346,6 +347,11 @@ class BambuMQTTClient:
             raise TimeoutError(f"No response data for sequence_id={seq_id}")
         
         return result
+    
+    @staticmethod
+    def random_sequence_id() -> str:
+        """Generate next sequence ID as a random 5-digit number string starting with '2'."""
+        return str(random.randint(20_000, 29_999))
     
     def _extract_sequence_id(self, payload: Dict) -> Optional[str]:
         """Extract sequence_id from payload dict.
