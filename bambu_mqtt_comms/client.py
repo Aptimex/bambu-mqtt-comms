@@ -74,10 +74,13 @@ class BambuMQTTClient:
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._pending_lock = threading.Lock()
         
-        # Push status waiting
+        # Push status waiting. The printer emits both full reports and
+        # incremental diffs on the same topic, so they are tracked separately.
         self._status_data: Optional[Dict] = None
+        self._full_status_data: Optional[Dict] = None
         self._status_lock = threading.Lock()
         self._status_event = threading.Event()
+        self._full_status_event = threading.Event()
     
     def _make_tls_context(self) -> ssl.SSLContext:
         """Create TLS context for MQTT connection (server verification disabled)."""
@@ -111,10 +114,18 @@ class BambuMQTTClient:
             return
         
         # Check for push_status (async status updates)
-        if "print" in data and data["print"].get("command") == "push_status":
+        if isinstance(data.get("print"), dict) and data["print"].get("command") == "push_status":
+            status = data["print"]
+            # "msg" distinguishes a full report (0) from an incremental diff
+            # (1). Firmware that omits it only sends full reports.
+            is_full = status.get("msg", 0) == 0
             with self._status_lock:
-                self._status_data = data["print"]
+                self._status_data = status
+                if is_full:
+                    self._full_status_data = status
             self._status_event.set()
+            if is_full:
+                self._full_status_event.set()
             return
         
         # Extract sequence_id from response
@@ -215,36 +226,49 @@ class BambuMQTTClient:
                 return self._status_data
         return None
     
-    def request_status(self, sequence_id: Optional[str] = None) -> Dict:
+    def request_status(
+        self, sequence_id: Optional[str] = None, timeout: float = 15.0
+    ) -> Dict:
         """
-        Request a full status push (pushall) and wait for push_status response.
-        
-        This uses a special mechanism: sends pushall as fire-and-forget, then waits for push_status
-        which is delivered asynchronously and doesn't share the request's sequence_id.
-        
+        Request a full status push (pushall) and wait for the push_status reply.
+
+        The reply is asynchronous and does not carry the request's sequence_id,
+        so it is matched by type rather than id. The printer also emits
+        incremental push_status diffs on the same topic, which contain only the
+        fields that changed; those are skipped here, because a caller asking
+        for status wants the complete picture (a diff arriving first would
+        otherwise look like a printer with no AMS).
+
         Args:
             sequence_id: Optional custom sequence_id for the pushall request.
-            
+            timeout: How long to wait for the full report.
+
         Returns:
-            The push_status response data.
+            The full push_status response data.
+
+        Raises:
+            TimeoutError: If no full push_status arrives within the timeout.
         """
         seq = sequence_id or self.random_sequence_id()
         payload = {"pushing": {"sequence_id": seq, "command": "pushall", "version": 1, "push_target": 1}}
-        
+
         # Clear previous status
         self._status_event.clear()
+        self._full_status_event.clear()
         with self._status_lock:
             self._status_data = None
-        
+            self._full_status_data = None
+
         # Send pushall as fire-and-forget (no response expected with same seq_id)
         self.publish(payload)
-        
-        # Wait for push_status (async, different sequence_id)
-        if not self._status_event.wait(timeout=15.0):
-            raise TimeoutError("Timeout waiting for push_status response")
-        
+
+        if not self._full_status_event.wait(timeout=timeout):
+            raise TimeoutError(
+                f"Timeout waiting for a full push_status response after {timeout}s"
+            )
+
         with self._status_lock:
-            return self._status_data or {}
+            return self._full_status_data or {}
     
     def get_trusted_certs(self, timeout: float = 10.0) -> Dict:
         """
@@ -267,24 +291,93 @@ class BambuMQTTClient:
             "security": {
                 "command": "app_cert_list",
                 "sequence_id": seq,
-                "timestamp": int(time.time()),
+                "timestamp": int(time.time() * 1000),
                 "type": "app"
             }
         }
-        
+
         response = self.send_and_wait(payload, timeout=timeout)
-        
+
         # Extract result from security scope
         security = response.get("security", {})
         result = security.get("result")
         cert_ids = security.get("cert_ids", [])
-        
+
         return {
             "result": result,
             "cert_ids": cert_ids,
             "cert_count": len(cert_ids),
         }
-    
+
+    def install_app_cert(
+        self,
+        bootstrap_message: Union[Dict, str],
+        cert_id: Optional[str] = None,
+        attempts: int = 6,
+        interval: float = 5.0,
+        query_timeout: float = 5.0,
+    ) -> Dict[str, Any]:
+        """
+        Publish an app_cert_install bootstrap and verify the printer accepted it.
+
+        The printer never acknowledges app_cert_install directly, so the message
+        is published fire-and-forget and the registration is confirmed by polling
+        app_cert_list until `cert_id` shows up among the trusted certs. Signed
+        commands sent before that lands are rejected (err_code 84033545), so
+        callers should treat a False `trusted` as "do not send signed commands".
+
+        Registration is not instantaneous and is lost on printer power-cycle, so
+        this must be re-run per session.
+
+        Args:
+            bootstrap_message: The app_cert_install payload, e.g. from
+                MQTTSigner.build_app_cert_install(). Strings are published as-is.
+            cert_id: The cert_id expected to become trusted (e.g.
+                MQTTSigner.get_cert_id()). If omitted, no verification is done
+                and the bootstrap is simply published.
+            attempts: Total app_cert_list polls, including the immediate first one.
+            interval: Seconds to wait between polls.
+            query_timeout: Per-poll response timeout in seconds.
+
+        Returns:
+            Dict with 'trusted' (bool), 'cert_ids' (list of str), and
+            'attempts_used' (int).
+
+        Raises:
+            ConnectionError: If not connected.
+        """
+        if not self.is_connected:
+            raise ConnectionError("Not connected. Call connect() first.")
+
+        self.publish(bootstrap_message)
+
+        if cert_id is None:
+            return {"trusted": False, "cert_ids": [], "attempts_used": 0}
+
+        cert_ids: list = []
+        for attempt in range(1, max(1, attempts) + 1):
+            # Poll immediately on the first pass: the cert may already be
+            # trusted from an earlier bootstrap this power cycle.
+            if attempt > 1:
+                time.sleep(interval)
+            try:
+                certs = self.get_trusted_certs(timeout=query_timeout)
+            except TimeoutError:
+                continue
+            cert_ids = certs.get("cert_ids", [])
+            if cert_id in cert_ids:
+                return {
+                    "trusted": True,
+                    "cert_ids": cert_ids,
+                    "attempts_used": attempt,
+                }
+
+        return {
+            "trusted": False,
+            "cert_ids": cert_ids,
+            "attempts_used": max(1, attempts),
+        }
+
     def send_and_wait(
         self,
         payload: Union[Dict, str],
@@ -293,17 +386,21 @@ class BambuMQTTClient:
     ) -> Dict:
         """
         Send a payload and wait for the matching response.
-        
+
         Matches response by sequence_id in the payload.
-        
+
+        A payload passed as a string is published byte-for-byte as given. This
+        matters for signed messages: their signature covers the exact bytes of
+        the command object, so re-serializing them would invalidate it.
+
         Args:
             payload: Dict or JSON string containing a sequence_id.
             timeout: Response timeout in seconds (default: config.response_timeout).
             qos: MQTT QoS level (default: 1).
-            
+
         Returns:
             Response dict from printer.
-            
+
         Raises:
             TimeoutError: If no response received within timeout.
             ConnectionError: If not connected.
@@ -311,27 +408,29 @@ class BambuMQTTClient:
         """
         if not self.is_connected:
             raise ConnectionError("Not connected. Call connect() first.")
-        
+
         timeout = timeout or self.config.response_timeout
-        
-        # Parse payload if string
+
+        # Parse a string payload only to read its sequence_id — the original
+        # bytes are what actually go on the wire.
         if isinstance(payload, str):
+            wire_msg = payload
             payload_dict = json.loads(payload)
         else:
             payload_dict = payload
-        
+            wire_msg = json.dumps(payload_dict, separators=(",", ":"))
+
         # Extract sequence_id
         seq_id = self._extract_sequence_id(payload_dict)
         if not seq_id:
             raise ValueError("Payload must contain a sequence_id")
-        
+
         # Register pending request
         event = threading.Event()
         with self._pending_lock:
             self._pending[seq_id] = {"event": event, "response": None, "timestamp": time.time()}
-        
+
         # Send
-        wire_msg = json.dumps(payload_dict, separators=(",", ":"))
         self._client.publish(self.config.request_topic, wire_msg, qos=qos)
         
         # Wait for response
