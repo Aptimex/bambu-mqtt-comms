@@ -5,6 +5,7 @@ Provides raw connection management and request/response handling.
 Command formatting and response parsing are left to the caller (e.g., bambu-mqtt-generator).
 """
 
+import copy
 import json
 import random
 import ssl
@@ -15,6 +16,23 @@ from typing import Any, Dict, Optional, Union
 import paho.mqtt.client as mqtt
 
 from .config import PrinterConfig
+
+
+def _deep_merge(target: Dict, updates: Dict) -> None:
+    """
+    Recursively merge updates into target, in place.
+
+    Nested dictionaries are merged key by key so an incremental report only
+    changes what it mentions. Lists are replaced: the printer sends them whole
+    (a partial ams report still carries every tray), and a partial list could
+    not be reconciled by position anyway.
+    """
+    for key, value in updates.items():
+        existing = target.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            _deep_merge(existing, value)
+        else:
+            target[key] = value
 
 
 class BambuMQTTError(Exception):
@@ -78,6 +96,10 @@ class BambuMQTTClient:
         # incremental diffs on the same topic, so they are tracked separately.
         self._status_data: Optional[Dict] = None
         self._full_status_data: Optional[Dict] = None
+        # Last full report with every later incremental report merged onto it,
+        # so the current state can be read without asking for a new one.
+        self._merged_status: Optional[Dict] = None
+        self._merged_status_at: float = 0.0
         self._status_lock = threading.Lock()
         self._status_event = threading.Event()
         self._full_status_event = threading.Event()
@@ -123,6 +145,11 @@ class BambuMQTTClient:
                 self._status_data = status
                 if is_full:
                     self._full_status_data = status
+                    self._merged_status = copy.deepcopy(status)
+                elif self._merged_status is not None:
+                    _deep_merge(self._merged_status, status)
+                if self._merged_status is not None:
+                    self._merged_status_at = time.monotonic()
             self._status_event.set()
             if is_full:
                 self._full_status_event.set()
@@ -226,6 +253,31 @@ class BambuMQTTClient:
                 return self._status_data
         return None
     
+    def get_status(self, max_age: Optional[float] = None) -> Optional[Dict]:
+        """
+        Return the current status without asking the printer for a new one.
+
+        The printer pushes status continuously - some firmware sends full
+        reports, some sends incremental ones - and those are accumulated into a
+        single picture as they arrive. Reading that costs nothing, where
+        request_status() publishes a pushall and waits for a full reply;
+        repeating the latter often enough makes a printer stop answering.
+
+        Args:
+            max_age: Reject the snapshot if it has not been updated within this
+                many seconds. None accepts it at any age.
+
+        Returns:
+            A copy of the current status, or None if nothing has been received
+            yet or the snapshot is older than max_age.
+        """
+        with self._status_lock:
+            if self._merged_status is None:
+                return None
+            if max_age is not None and (time.monotonic() - self._merged_status_at) > max_age:
+                return None
+            return copy.deepcopy(self._merged_status)
+
     def request_status(
         self, sequence_id: Optional[str] = None, timeout: float = 15.0
     ) -> Dict:
