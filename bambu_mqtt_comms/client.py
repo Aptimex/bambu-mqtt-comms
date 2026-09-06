@@ -35,6 +35,16 @@ def _deep_merge(target: Dict, updates: Dict) -> None:
             target[key] = value
 
 
+# Shortest gap allowed between two pushalls to the same printer, matching
+# Bambu Studio's REQUEST_PUSH_MIN_TIME (DeviceManager.hpp) and the override in
+# MachineObject::command_request_push_all, which drops a too-soon request
+# unless the caller passes request_now.
+#
+# Although Bambu Studio uses this value, some older printers actually require 
+# much longer delays in practice (~30s) or risk becoming unresponsive/unstable. 
+REQUEST_PUSH_MIN_INTERVAL = 3.0
+
+
 class BambuMQTTError(Exception):
     """Base exception for Bambu MQTT client errors."""
     pass
@@ -100,6 +110,10 @@ class BambuMQTTClient:
         # so the current state can be read without asking for a new one.
         self._merged_status: Optional[Dict] = None
         self._merged_status_at: float = 0.0
+        # When this printer was last sent a pushall. Kept on the client rather
+        # than reset per connection, so reconnecting cannot be used to ask
+        # again immediately. See REQUEST_PUSH_MIN_INTERVAL.
+        self._pushall_at: float = 0.0
         self._status_lock = threading.Lock()
         self._status_event = threading.Event()
         self._full_status_event = threading.Event()
@@ -169,13 +183,25 @@ class BambuMQTTClient:
                     self._pending[seq_id]["response"] = data
                     self._pending[seq_id]["event"].set()
     
-    def connect(self, timeout: float = 15.0) -> None:
+    def connect(self, timeout: float = 15.0, prime_status: bool = True) -> None:
         """
         Connect to the printer's MQTT broker.
-        
+
+        Unless prime_status is False, one pushall is sent once connected so
+        get_status() has something to report. This is not just an optimization:
+        the accumulated status is only ever seeded by a full report, and some
+        printers send none unprompted, so without it there would be nothing
+        for those reports to accumulate onto and get_status() would keep
+        returning None for the life of the connection.
+
+        A printer that does not answer the pushall is not treated as a failed
+        connection: the request is throttled like any other, so the next caller
+        to want status will ask again.
+
         Args:
             timeout: Connection timeout in seconds.
-            
+            prime_status: Request one full report once connected.
+
         Raises:
             ConnectionError: If connection fails or times out.
         """
@@ -207,6 +233,12 @@ class BambuMQTTClient:
             self._client.loop_stop()
             self._client = None
             raise self._connect_error
+
+        if prime_status:
+            try:
+                self.request_status(timeout=timeout)
+            except (TimeoutError, ConnectionError):
+                pass  # not fatal; the next status read will ask again
     
     def disconnect(self) -> None:
         """Disconnect from the printer."""
@@ -279,7 +311,10 @@ class BambuMQTTClient:
             return copy.deepcopy(self._merged_status)
 
     def request_status(
-        self, sequence_id: Optional[str] = None, timeout: float = 15.0
+        self,
+        sequence_id: Optional[str] = None,
+        timeout: float = 15.0,
+        force: bool = False,
     ) -> Dict:
         """
         Request a full status push (pushall) and wait for the push_status reply.
@@ -291,16 +326,35 @@ class BambuMQTTClient:
         for status wants the complete picture (a diff arriving first would
         otherwise look like a printer with no AMS).
 
+        Asking too often is what to avoid: a pushall makes the printer build
+        and send a full report, and enough of them in a row makes some printers
+        stop answering altogether. So a request made within
+        REQUEST_PUSH_MIN_INTERVAL of the last one returns the accumulated
+        status instead of going to the printer, the way Bambu Studio's
+        command_request_push_all drops one and returns -1. Callers who MUST get
+        a genuinely fresh report pass force=True, its version of request_now.
+
         Args:
             sequence_id: Optional custom sequence_id for the pushall request.
             timeout: How long to wait for the full report.
+            force: Send even if the last pushall was too recent.
 
         Returns:
-            The full push_status response data.
+            The full push_status response data. When the request is throttled
+            this is the accumulated status, which is not a full report but is
+            the most current picture available; it is empty only if nothing has
+            been received at all.
 
         Raises:
             TimeoutError: If no full push_status arrives within the timeout.
         """
+        with self._status_lock:
+            since = time.monotonic() - self._pushall_at
+        if not force and since < REQUEST_PUSH_MIN_INTERVAL:
+            current = self.get_status()
+            if current is not None:
+                return current
+
         seq = sequence_id or self.random_sequence_id()
         payload = {"pushing": {"sequence_id": seq, "command": "pushall", "version": 1, "push_target": 1}}
 
@@ -310,6 +364,11 @@ class BambuMQTTClient:
         with self._status_lock:
             self._status_data = None
             self._full_status_data = None
+
+        # Recorded before the wait, so a printer that never answers still
+        # counts as having been asked and cannot be asked again immediately.
+        with self._status_lock:
+            self._pushall_at = time.monotonic()
 
         # Send pushall as fire-and-forget (no response expected with same seq_id)
         self.publish(payload)
