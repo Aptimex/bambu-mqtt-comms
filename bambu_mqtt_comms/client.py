@@ -11,7 +11,13 @@ import random
 import ssl
 import time
 import threading
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
+
+try:                                    # Protocol landed in typing in 3.8
+    from typing import Protocol
+except ImportError:                     # pragma: no cover
+    Protocol = object                   # type: ignore[assignment,misc]
 
 import paho.mqtt.client as mqtt
 
@@ -60,6 +66,117 @@ class TimeoutError(BambuMQTTError):
     pass
 
 
+# The printer's "you did not sign a command that needs signing" code. This is
+# deliberately duplicated from bambu-mqtt-generator's SIGNATURE_REQUIRED_ERR
+# rather than imported: this library knows how to talk to a printer and nothing
+# about payload construction, and taking a dependency on the generator just to
+# share one integer would couple the two for no benefit.
+SIGNATURE_REQUIRED_ERR = 84033543
+
+# Prefix for the throwaway command name used by probe_signing_required(). The
+# random suffix keeps it from ever colliding with a real command, including one
+# Bambu might add in future firmware.
+_SIGNING_PROBE_PREFIX = "bmqtt_sign_probe_"
+
+# How long to wait for a certificate bootstrap started at connect time before
+# giving up on it and sending unsigned. install_app_cert() polls for up to
+# roughly 30s, which is what slower printers actually take.
+BOOTSTRAP_WAIT_TIMEOUT = 45.0
+
+
+class SignerProtocol(Protocol):
+    """What this library needs from a signer, structurally.
+
+    bambu-mqtt-generator's MQTTSigner satisfies this as-is. Typing it as a
+    protocol rather than importing that class keeps the two libraries
+    independent: the caller owns the credentials and the payload format, and
+    this library only ever asks for bytes to put on the wire.
+    """
+
+    def sign(self, payload: Dict) -> str: ...
+
+    def get_cert_id(self) -> str: ...
+
+    def build_app_cert_install(self, sequence_id: Optional[str] = None) -> str: ...
+
+
+@dataclass
+class SigningState:
+    """What we have worked out about a printer's signing policy.
+
+    Lives and dies with one connection. The printer forgets registered
+    certificates when it power-cycles, and a user can toggle Developer mode
+    between sessions, so none of this is worth carrying across connections.
+    """
+
+    # Does this printer reject unsigned commands? None until determined.
+    required: Optional[bool] = None
+    # True when the probe could not get an answer and `required` is a guess.
+    probe_inconclusive: bool = False
+    # How we found out: "probe" at connect time, "rejection" from a real command.
+    detected_by: str = ""
+    # Whether a signer was supplied at all.
+    credentials_available: bool = False
+    # Printer answered app_cert_list (None = never asked or no answer).
+    supported: Optional[bool] = None
+    # Printer currently trusts our certificate, so signed commands will verify.
+    cert_trusted: bool = False
+    # A registration is in flight on a background thread.
+    bootstrap_pending: bool = False
+    # Why registration failed, if it did.
+    bootstrap_error: Optional[str] = None
+
+    def describe(self) -> Optional[str]:
+        """A one-line explanation of anything the user needs to act on.
+
+        Returns None when there is nothing to say, which is the usual case:
+        a printer that does not require signing needs no credentials and
+        produces no message, whether or not any were supplied.
+        """
+        if not self.required:
+            return None
+
+        if not self.credentials_available:
+            return (
+                "This printer requires signed commands. Either enable LAN Mode "
+                "and Developer mode on the printer, or supply signing "
+                "credentials (key_pem_file, cert_chain_pem_file, crl_pem_file)."
+            )
+
+        if self.cert_trusted:
+            return None
+
+        if self.bootstrap_pending:
+            return (
+                "This printer requires signed commands; registering the signing "
+                "certificate with it. This can take up to 30 seconds."
+            )
+
+        if self.bootstrap_error:
+            return (
+                "This printer requires signed commands, but registering the "
+                f"signing certificate failed: {self.bootstrap_error}."
+            )
+
+        return (
+            "This printer requires signed commands, but its signing certificate "
+            "is not registered, so commands will be rejected."
+        )
+
+
+def find_err_code(response: Dict[str, Any]) -> Optional[int]:
+    """Pull an err_code out of a printer response, whichever scope carries it."""
+    if not isinstance(response, dict):
+        return None
+    for section in response.values():
+        if isinstance(section, dict) and "err_code" in section:
+            try:
+                return int(section["err_code"])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 class BambuMQTTClient:
     """
     MQTT client for Bambu Lab printer communication.
@@ -84,14 +201,30 @@ class BambuMQTTClient:
             client.publish({"print": {"sequence_id": "456", "command": "pause"}})
     """
     
-    def __init__(self, config: PrinterConfig):
+    def __init__(
+        self,
+        config: PrinterConfig,
+        signer: Optional["SignerProtocol"] = None,
+    ):
         """
         Initialize the MQTT client.
         
         Args:
             config: PrinterConfig with connection details.
+            signer: Optional signer (e.g. bambu-mqtt-generator's MQTTSigner).
+                Supplying one lets send_command() sign automatically on
+                printers that need it. Omitting it is entirely normal: most
+                printers are in LAN + Developer mode and accept unsigned
+                commands, and this client never needs credentials for them.
         """
         self.config = config
+        self._signer = signer
+
+        # Signing policy for the current connection; see _detect_signing().
+        self.signing = SigningState(credentials_available=signer is not None)
+        self._bootstrap_done = threading.Event()
+        self._bootstrap_done.set()
+        self._bootstrap_lock = threading.Lock()
         
         self._client: Optional[mqtt.Client] = None
         self._connected = False
@@ -183,7 +316,12 @@ class BambuMQTTClient:
                     self._pending[seq_id]["response"] = data
                     self._pending[seq_id]["event"].set()
     
-    def connect(self, timeout: float = 15.0, prime_status: bool = True) -> None:
+    def connect(
+        self,
+        timeout: float = 15.0,
+        prime_status: bool = True,
+        detect_signing: bool = True,
+    ) -> None:
         """
         Connect to the printer's MQTT broker.
 
@@ -198,9 +336,15 @@ class BambuMQTTClient:
         connection: the request is throttled like any other, so the next caller
         to want status will ask again.
 
+        Signing policy is worked out here too, unless detect_signing is False.
+        It costs one round trip and no credentials; see _detect_signing().
+
         Args:
             timeout: Connection timeout in seconds.
             prime_status: Request one full report once connected.
+            detect_signing: Work out whether this printer needs signed
+                commands, and start registering our certificate if it does
+                and we have one.
 
         Raises:
             ConnectionError: If connection fails or times out.
@@ -208,6 +352,7 @@ class BambuMQTTClient:
         if self._connected:
             return
         
+        self._reset_signing_state()
         self._connect_event.clear()
         self._connect_error = None
         
@@ -234,6 +379,17 @@ class BambuMQTTClient:
             self._client = None
             raise self._connect_error
 
+        # Before prime_status, so that a certificate registration started here
+        # runs while the pushall round trip is in flight rather than after it.
+        if detect_signing:
+            try:
+                self._detect_signing()
+            except Exception:
+                # Detection is an optimization. A printer we could not probe is
+                # handled by send_command()'s reaction to a rejection instead,
+                # so nothing here is worth failing a working connection over.
+                pass
+
         if prime_status:
             try:
                 self.request_status(timeout=timeout)
@@ -247,6 +403,7 @@ class BambuMQTTClient:
             self._client.loop_stop()
             self._client = None
         self._connected = False
+        self._reset_signing_state()
     
     @property
     def is_connected(self) -> bool:
@@ -488,6 +645,234 @@ class BambuMQTTClient:
             "cert_ids": cert_ids,
             "attempts_used": max(1, attempts),
         }
+
+    # ── Signing policy ────────────────────────────────────────────────────────
+
+    @property
+    def can_sign(self) -> bool:
+        """Whether a signed command would actually verify right now."""
+        return self._signer is not None and self.signing.cert_trusted
+
+    def _reset_signing_state(self) -> None:
+        """Forget everything learned about signing. Called per connection."""
+        self.signing = SigningState(
+            credentials_available=self._signer is not None
+        )
+        self._bootstrap_done.set()
+
+    def probe_signing_required(self, timeout: Optional[float] = None) -> Optional[bool]:
+        """
+        Ask the printer whether it requires signed commands.
+
+        Publishes an unsigned message whose command name is randomly generated
+        and therefore matches nothing in the firmware. The printer checks the
+        signature before it looks up the command name, so:
+
+          * a printer that requires signing answers SIGNATURE_REQUIRED_ERR
+          * a printer that does not answers success (having found nothing to do)
+
+        Because no such command exists there is no handler to reach, so this is
+        safe to send in any printer state, including mid-print. It needs no
+        certificate and no bootstrap, which is the whole point: it tells us
+        whether paying for a registration is necessary before we pay for one.
+
+        Args:
+            timeout: Response timeout (default: config.response_timeout).
+
+        Returns:
+            True if signing is required, False if not, None if the printer did
+            not answer. Callers should treat None as "not required" and rely on
+            send_command() reacting to a rejection instead.
+        """
+        payload = {
+            "print": {
+                "command": f"{_SIGNING_PROBE_PREFIX}{random.randrange(16 ** 8):08x}",
+                "sequence_id": self.random_sequence_id(),
+            }
+        }
+        try:
+            response = self.send_and_wait(payload, timeout=timeout)
+        except (TimeoutError, ConnectionError):
+            return None
+        return find_err_code(response) == SIGNATURE_REQUIRED_ERR
+
+    def _detect_signing(self) -> None:
+        """Work out this printer's signing policy, cheaply, at connect time.
+
+        The ladder is ordered so that the expensive step is only ever reached
+        by a printer that actually needs it:
+
+          1. probe (one round trip, no credentials) - most printers stop here
+          2. app_cert_list, only if signing is required: our certificate may
+             already be registered from earlier this power cycle, in which case
+             there is nothing to do
+          3. app_cert_install on a background thread, only if it is not
+        """
+        required = self.probe_signing_required()
+        self.signing.probe_inconclusive = required is None
+        self.signing.required = bool(required)
+        self.signing.detected_by = "probe" if required is not None else ""
+
+        # Nothing further to do for a printer that accepts unsigned commands —
+        # which is the common case, and costs exactly the one probe above.
+        if not self.signing.required:
+            return
+
+        # Signing is required but we have no credentials. Not an error here:
+        # the caller may not care, and send_command() will explain itself if a
+        # command is actually rejected.
+        if self._signer is None:
+            return
+
+        try:
+            certs = self.get_trusted_certs()
+            self.signing.supported = True
+            if self._signer.get_cert_id() in certs.get("cert_ids", []):
+                self.signing.cert_trusted = True
+                return
+        except (TimeoutError, ConnectionError, BambuMQTTError):
+            # Couldn't read the list; fall through and try registering anyway.
+            pass
+
+        self._start_bootstrap()
+
+    def _start_bootstrap(self) -> None:
+        """Register our certificate on a background thread.
+
+        Backgrounded because this is the one slow step in the whole process:
+        the printer acknowledges nothing, so install_app_cert() polls, and some
+        printers take close to 30 seconds to report the certificate as
+        trusted. Callers that are about to send a signed command wait via
+        await_signing_ready(); everything else proceeds immediately.
+        """
+        with self._bootstrap_lock:
+            if self.signing.bootstrap_pending:
+                return
+            self.signing.bootstrap_pending = True
+            self.signing.bootstrap_error = None
+            self._bootstrap_done.clear()
+
+        threading.Thread(
+            target=self._run_bootstrap,
+            name=f"bambu-cert-bootstrap-{self.config.serial}",
+            daemon=True,
+        ).start()
+
+    def _run_bootstrap(self) -> None:
+        cert_id = None
+        try:
+            cert_id = self._signer.get_cert_id()
+            result = self.install_app_cert(
+                self._signer.build_app_cert_install(), cert_id=cert_id
+            )
+            self.signing.supported = True
+            self.signing.cert_trusted = bool(result.get("trusted"))
+            if not self.signing.cert_trusted:
+                self.signing.bootstrap_error = (
+                    f"printer did not report certificate {cert_id} as trusted "
+                    f"after {result.get('attempts_used')} checks"
+                )
+        except Exception as e:
+            self.signing.cert_trusted = False
+            self.signing.bootstrap_error = f"{type(e).__name__}: {e}"
+        finally:
+            self.signing.bootstrap_pending = False
+            self._bootstrap_done.set()
+
+    def await_signing_ready(self, timeout: float = BOOTSTRAP_WAIT_TIMEOUT) -> bool:
+        """Wait for any in-flight certificate registration to settle.
+
+        Args:
+            timeout: Seconds to wait.
+
+        Returns:
+            True if a signed command would now verify.
+        """
+        self._bootstrap_done.wait(timeout)
+        return self.can_sign
+
+    def signing_status_message(self) -> Optional[str]:
+        """A user-facing explanation of the signing situation, or None.
+
+        None means there is nothing the user needs to know or do, which is the
+        normal outcome for a printer in LAN + Developer mode with no
+        credentials configured.
+        """
+        return self.signing.describe()
+
+    def send_command(
+        self,
+        payload: Union[Dict, str],
+        timeout: Optional[float] = None,
+        retry_signed: bool = True,
+    ) -> Dict:
+        """
+        Send a command, signing it if this printer needs that, and wait.
+
+        This is the method to use for anything the printer might refuse over
+        signing. It signs when signing is both required and possible, and if a
+        command still comes back rejected for want of a signature it records
+        that, registers the certificate, and retries once. That last part is
+        the backstop for a printer whose policy changed since we connected, or
+        one the connect-time probe could not reach.
+
+        A printer that does not require signing is sent the payload untouched,
+        so a caller with no credentials is fully supported and pays nothing.
+
+        Args:
+            payload: The command, as a dict or a pre-serialized JSON string.
+                Signing needs a dict; a string is parsed first, and the signer
+                re-serializes it canonically.
+            timeout: Response timeout (default: config.response_timeout).
+            retry_signed: Register and retry once on a signature rejection.
+
+        Returns:
+            The printer's response dict. Signing problems are reported through
+            the response's err_code and signing_status_message(), not raised,
+            so callers handle them alongside every other command failure.
+
+        Raises:
+            TimeoutError: If no response is received.
+            ConnectionError: If not connected.
+        """
+        if not self.is_connected:
+            raise ConnectionError("Not connected. Call connect() first.")
+
+        # Don't send unsigned while a registration we know is needed is still
+        # in flight — waiting is strictly better than a guaranteed rejection.
+        if self.signing.required and self._signer is not None:
+            self.await_signing_ready()
+
+        response = self.send_and_wait(self._wire(payload), timeout=timeout)
+
+        if find_err_code(response) != SIGNATURE_REQUIRED_ERR:
+            return response
+
+        # The printer just told us, authoritatively, that it needs signatures.
+        # Only claim credit for finding that out here if the probe had not
+        # already established it, so detected_by stays diagnostic.
+        if not self.signing.required:
+            self.signing.detected_by = "rejection"
+        self.signing.required = True
+        self.signing.probe_inconclusive = False
+
+        if not retry_signed or self._signer is None:
+            return response
+
+        if not self.can_sign:
+            self._start_bootstrap()
+            self.await_signing_ready()
+        if not self.can_sign:
+            return response
+
+        return self.send_and_wait(self._wire(payload), timeout=timeout)
+
+    def _wire(self, payload: Union[Dict, str]) -> Union[Dict, str]:
+        """Sign the payload if we can, otherwise hand it back unchanged."""
+        if not self.can_sign:
+            return payload
+        as_dict = json.loads(payload) if isinstance(payload, str) else payload
+        return self._signer.sign(as_dict)
 
     def send_and_wait(
         self,

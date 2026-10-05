@@ -3,8 +3,9 @@
 Minimal Python library for MQTT communication with Bambu Lab 3D printers over
 the local network.
 
-It handles the connection, request/response correlation, and the certificate
-bootstrap that signed commands require. It deliberately knows nothing about
+It handles the connection, request/response correlation, working out whether a
+given printer requires signed commands, and the certificate bootstrap that
+those commands require. It deliberately knows nothing about
 command formats: building payloads, signing them, and parsing replies are the
 job of the companion library **bambu-mqtt-generator**, which also documents a
 complete read-modify-verify workflow using both libraries.
@@ -65,8 +66,87 @@ TLS is used, but the printer's certificate is not verified.
 
 ### Connection
 
-`connect(timeout=15.0)` / `disconnect()` — or use the client as a context
-manager, which does both. `is_connected` reports the current state.
+`connect(timeout=15.0, prime_status=True, detect_signing=True)` / `disconnect()`
+— or use the client as a context manager, which does both. `is_connected`
+reports the current state.
+
+`detect_signing=True` runs the ladder in [Signing policy](#signing-policy) as
+part of connecting. Pass `False` to skip it entirely and do your own signing.
+
+A signer may be supplied at construction:
+
+```python
+client = BambuMQTTClient(config, signer=signer)   # signer is optional
+```
+
+Any object with `sign(payload) -> str`, `get_cert_id() -> str` and
+`build_app_cert_install(sequence_id=None) -> str` will do; **bambu-mqtt-generator**'s
+`MQTTSigner` satisfies it as-is. The type is declared as `SignerProtocol`
+structurally, so this library takes no dependency on that one.
+
+### Signing policy
+
+Printers on firmware newer than (approximately) January 2025 reject unsigned
+commands **unless** the printer is in LAN-Only + Developer Mode. Which case a
+given printer is in is detectable, and this library detects it rather than
+asking you to configure it.
+
+**`probe_signing_required(timeout=None) -> bool | None`**
+
+Publishes an unsigned command whose name is randomly generated and therefore
+matches nothing in the firmware. The printer verifies the signature *before* it
+looks up the command name, so a printer that requires signing answers
+`err_code` 84033543 while one that does not answers success, having found
+nothing to do. Because no such command exists there is no handler to reach,
+which makes this safe to send in any printer state, including mid-print.
+
+It needs no certificate and no bootstrap — that is the point. Registration is
+the one slow step in the whole process, and this establishes whether paying for
+it is necessary before paying for it.
+
+Returns `True`, `False`, or `None` if the printer did not answer. Treat `None`
+as "not required"; `send_command` catches the other case on the first real
+command.
+
+**`connect(detect_signing=True)`** runs, in order:
+
+1. the probe above — one round trip. Most printers stop here.
+2. `get_trusted_certs()`, only if signing is required: the certificate may
+   already be registered from earlier this power cycle, in which case there is
+   nothing to do.
+3. `install_app_cert()` on a background thread, only if it is not.
+
+**`send_command(payload, timeout=None, retry_signed=True) -> dict`**
+
+The method to use for anything a printer might refuse over signing. It signs
+when signing is both required and possible, waits for an in-flight
+registration first, and if a command still comes back with 84033543 it records
+that, registers the certificate, and retries once. That last part is the
+backstop for a printer whose policy changed since connecting, or one the probe
+could not reach. A printer that does not require signing is sent the payload
+untouched, so a caller with no signer is fully supported and pays nothing.
+
+**`signing` → `SigningState`** — what has been worked out so far: `required`,
+`probe_inconclusive`, `detected_by`, `credentials_available`, `supported`,
+`cert_trusted`, `bootstrap_pending`, `bootstrap_error`. It lives and dies with
+one connection, since printers forget certificates on power cycle and
+Developer mode can be toggled between sessions.
+
+**`can_sign`** — whether a signed command would verify right now.
+
+**`await_signing_ready(timeout=45.0) -> bool`** — block until an in-flight
+registration settles.
+
+**`signing_status_message() -> str | None`** — a one-line, user-facing
+explanation of anything the user needs to act on, or `None` when there is
+nothing to say. `None` is the normal outcome for a printer in LAN+DEV mode.
+
+```python
+with BambuMQTTClient(config, signer=signer) as client:
+    reply = client.send_command(payload)
+    if msg := client.signing_status_message():
+        print(msg)
+```
 
 ### Sending
 
@@ -107,7 +187,9 @@ a printer with no AMS. Raises `TimeoutError` if no full report arrives.
 
 ### Certificate bootstrap
 
-Printers on firmware newer than (approximately) January 2025 reject unsigned commands by default, unless the printer is placed into LAN-Only and Developer Mode (LAN+DEV mode).
+`connect()` and `send_command()` handle this for you. The primitives below are
+public for callers doing their own signing, or skipping detection.
+
 Trusted certificates for signing have to be "bootstrapped" into the printer's memory and are lost at every power cycle. 
 Some printers can hold multiple trusted certs simultaneously, while others can only hold one that is replaced by a new bootstrapping command.
 Each Bambu application has application-specific certificates and signing key, and always perform the bootstrapping step during the MQTT connection process.

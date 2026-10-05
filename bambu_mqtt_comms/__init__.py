@@ -21,9 +21,30 @@ Example:
 
         # Fire-and-forget
         client.publish({"print": {"sequence_id": "20002", "command": "pause"}})
+
+Printers on recent firmware that are not in LAN + Developer mode reject
+unsigned commands. connect() detects that in one round trip without needing
+any credentials, and send_command() signs automatically when a signer was
+supplied and the printer needs it:
+
+        with BambuMQTTClient(config, signer=my_signer) as client:
+            response = client.send_command({"print": {...}})
+            if msg := client.signing_status_message():
+                print(msg)      # None unless the user needs to act
+
+Supplying no signer is fully supported and is the common case.
 """
 
-from .client import BambuMQTTClient, BambuMQTTError, ConnectionError, TimeoutError
+from .client import (
+    BambuMQTTClient,
+    BambuMQTTError,
+    ConnectionError,
+    TimeoutError,
+    SignerProtocol,
+    SigningState,
+    SIGNATURE_REQUIRED_ERR,
+    find_err_code,
+)
 from .config import PrinterConfig
 
 __version__ = "0.1.0"
@@ -34,4 +55,8 @@ __all__ = [
     "BambuMQTTError",
     "ConnectionError",
     "TimeoutError",
+    "SignerProtocol",
+    "SigningState",
+    "SIGNATURE_REQUIRED_ERR",
+    "find_err_code",
 ]
