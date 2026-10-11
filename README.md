@@ -7,7 +7,7 @@ It handles the connection, request/response correlation, working out whether a
 given printer requires signed commands, and the certificate bootstrap that
 those commands require. It deliberately knows nothing about
 command formats: building payloads, signing them, and parsing replies are the
-job of the companion library **bambu-mqtt-generator**, which also documents a
+job of the companion library [bambu-mqtt-generator](https://github.com/Aptimex/bambu-mqtt-generator), which also documents a
 complete read-modify-verify workflow using both libraries.
 
 While intended to be a generic library, this was built and tested for the express purposes of building a program that monitors and controls AMS filament settings. 
