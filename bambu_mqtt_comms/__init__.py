@@ -47,7 +47,12 @@ from .client import (
 )
 from .config import PrinterConfig
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("bambu-mqtt-comms")
+except PackageNotFoundError:  # running from a source tree without installing
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "BambuMQTTClient",
