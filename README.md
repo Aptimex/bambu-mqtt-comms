@@ -17,6 +17,10 @@ This library's code is primarily AI generated and maintained, but is validated a
 
 ## Installation
 
+```bash
+pip install bambu-mqtt-comms
+```
+
 From a source checkout:
 
 ```bash
@@ -243,6 +247,7 @@ imported by name.
 
 ## License and scope
 
-MIT licensed. This is an independent project, not affiliated with or endorsed
-by Bambu Lab. It speaks an undocumented protocol that vendor firmware updates
-can change without notice.
+Licensed under the GNU Affero General Public License v3.0 or later (see `LICENSE`).
+This is an independent project, not affiliated with or endorsed by Bambu Lab.
+It speaks an undocumented protocol that vendor firmware updates can change
+without notice.

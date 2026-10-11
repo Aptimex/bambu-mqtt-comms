@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,10 +8,13 @@ version = "0.1.0"
 description = "MQTT communication library for Bambu Lab printers"
 readme = "README.md"
 requires-python = ">=3.8"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Aptimex" }]
+keywords = ["bambu", "bambu-lab", "mqtt", "3d-printing", "ams"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -22,6 +25,11 @@ classifiers = [
 dependencies = [
     "paho-mqtt>=2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Aptimex/bambu-mqtt-comms"
+Repository = "https://github.com/Aptimex/bambu-mqtt-comms"
+Issues = "https://github.com/Aptimex/bambu-mqtt-comms/issues"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
